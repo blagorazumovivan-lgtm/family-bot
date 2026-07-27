@@ -1,217 +1,332 @@
 """
-Семейный Telegram-бот.
+Семейный Telegram-бот Blazor.
 
 Возможности:
-  /start    — главное меню с кнопками
-  /send     — написать анонимное сообщение
-  /inbox    — посмотреть последние анонимные сообщения
-  /help     — справка
-  /stats    — сколько всего сообщений
+  /start   — поприветствовать / зарегистрироваться
+  Написать письмо — выбрать получателя и отправить анонимное письмо
+  Входящие — посмотреть письма, адресованные тебе
+  Помощь  — справка
 
-Кнопки под сообщением:
-  ✉️ Написать анонимно
-  📥 Входящие
-  ℹ️ Помощь
+Хранение:
+  users    — кто зарегистрировался (telegram_id ↔ name)
+  messages — анонимные письма (только recipient_name, без автора)
 """
 
 import os
 
 import telebot
 from dotenv import load_dotenv
-from telebot.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telebot.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
-from db import count_messages, get_recent_messages, save_message
+from db import (
+    count_messages,
+    count_users,
+    get_all_users,
+    get_messages_for_recipient,
+    get_user_by_telegram_id,
+    register_user,
+    save_message,
+)
 
-# Загружаем токен из .env
+# ---------- Настройка ----------
+
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не найден в .env")
 
 bot = telebot.TeleBot(TOKEN)
 
-# Кто сейчас в режиме "пишу сообщение"
-# Ключ — user_id, значение — None или "writing"
+# Состояния пользователей:
+#   None                       — обычный режим
+#   "awaiting_name"            — ждём имя для регистрации
+#   "writing:<recipient_name>" — пишем письмо для конкретного получателя
 user_states: dict[int, str] = {}
 
 
-# ---------- Клавиатуры (кнопки) ----------
+# ---------- Тексты ----------
 
-def main_keyboard() -> InlineKeyboardMarkup:
-    """Главное меню с тремя кнопками."""
-    kb = InlineKeyboardMarkup(row_width=2)
+WELCOME_NEW = (
+    "Привет. Я — <b>Blazor</b>, ваш семейный бот.\n\n"
+    "Помогу спланировать расписание и добавлю тёплых моментов "
+    "в ваши будни. Здесь можно писать друг другу анонимные письма "
+    "и делиться тем, что на душе.\n\n"
+    "Напишите, пожалуйста, как вас зовут — это имя увидят другие "
+    "члены семьи, когда будут писать вам."
+)
+
+WELCOME_BACK = (
+    "С возвращением, <b>{name}</b>.\n"
+    "Используйте кнопки внизу, чтобы написать письмо "
+    "или посмотреть входящие."
+)
+
+HELP_TEXT = (
+    "<b>Что я умею:</b>\n\n"
+    "<b>Написать письмо</b> — выбрать получателя и отправить "
+    "анонимное письмо\n"
+    "<b>Входящие</b> — посмотреть письма, адресованные вам\n"
+    "<b>Помощь</b> — эта справка\n\n"
+    "Все письма анонимны. Никто не узнает автора."
+)
+
+EMPTY_INBOX = "Входящих пока нет. Подождите, пока кто-то решит вам написать."
+
+NO_RECIPIENTS = (
+    "В семье пока только вы. Попросите близких запустить бота — "
+    "пусть каждый представится, и тогда можно будет писать друг другу."
+)
+
+NAME_REJECTED = "Имя должно быть от 1 до 40 символов. Попробуйте ещё раз."
+
+
+# ---------- Клавиатуры ----------
+
+def main_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Главное меню — кнопки внизу экрана (persistent)."""
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(
-        InlineKeyboardButton("✉️ Написать анонимно", callback_data="write"),
-        InlineKeyboardButton("📥 Входящие", callback_data="inbox"),
+        KeyboardButton("Написать письмо"),
+        KeyboardButton("Входящие"),
     )
-    kb.add(InlineKeyboardButton("ℹ️ Помощь", callback_data="help"))
+    kb.add(KeyboardButton("Помощь"))
     return kb
 
 
-def after_write_keyboard() -> InlineKeyboardMarkup:
-    """Кнопки после того, как сообщение сохранено."""
+def recipient_keyboard(current_user_name: str) -> InlineKeyboardMarkup | None:
+    """Inline-кнопки со всеми членами семьи, кроме самого юзера."""
+    users = get_all_users()
+    recipients = [
+        u for u in users if u["name"].lower() != current_user_name.lower()
+    ]
+    if not recipients:
+        return None
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("📥 Посмотреть входящие", callback_data="inbox"),
-        InlineKeyboardButton("✉️ Написать ещё", callback_data="write"),
-    )
+    for user in recipients:
+        kb.add(
+            InlineKeyboardButton(
+                user["name"],
+                callback_data=f"to:{user['name']}",
+            )
+        )
     return kb
+
+
+# ---------- Вспомогательное ----------
+
+def clear_state(user_id: int) -> None:
+    user_states.pop(user_id, None)
 
 
 # ---------- Команды ----------
 
 @bot.message_handler(commands=["start"])
 def handle_start(message: Message) -> None:
-    """Приветственное сообщение с кнопками."""
-    text = (
-        "👋 <b>Привет! Я — семейный бот.</b>\n\n"
-        "Тут можно:\n"
-        "✉️  написать <b>анонимное</b> сообщение\n"
-        "📥  почитать, что пишут другие\n\n"
-        "Автор всегда остаётся инкогнито. Никаких имён, "
-        "никаких утечек.\n\n"
-        "Выбирай:"
-    )
-    bot.send_message(
-        message.chat.id,
-        text,
-        parse_mode="HTML",
-        reply_markup=main_keyboard(),
-    )
+    clear_state(message.from_user.id)
+    user = get_user_by_telegram_id(message.from_user.id)
+
+    if user:
+        bot.send_message(
+            message.chat.id,
+            WELCOME_BACK.format(name=user["name"]),
+            parse_mode="HTML",
+            reply_markup=main_reply_keyboard(),
+        )
+    else:
+        user_states[message.from_user.id] = "awaiting_name"
+        bot.send_message(
+            message.chat.id,
+            WELCOME_NEW,
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
 
 @bot.message_handler(commands=["help"])
 def handle_help(message: Message) -> None:
-    """Справка по командам."""
-    text = (
-        "🤖 <b>Что я умею:</b>\n\n"
-        "/start — главное меню\n"
-        "/send — написать анонимное сообщение\n"
-        "/inbox — посмотреть последние 10 сообщений\n"
-        "/stats — сколько всего анонимок получено\n"
-        "/help — эта справка\n\n"
-        "💡 <i>Совет: просто напиши /start и тыкай кнопки.</i>"
-    )
-    bot.send_message(message.chat.id, text, parse_mode="HTML")
-
-
-@bot.message_handler(commands=["send"])
-def handle_send(message: Message) -> None:
-    """Начать писать анонимное сообщение."""
-    user_states[message.from_user.id] = "writing"
+    clear_state(message.from_user.id)
     bot.send_message(
         message.chat.id,
-        "✍️ <b>Окей, пиши.</b>\n"
-        "Я сохраню текст как есть, без автора. "
-        "Чтобы отменить — нажми /start.",
+        HELP_TEXT,
         parse_mode="HTML",
+        reply_markup=main_reply_keyboard(),
     )
 
 
-@bot.message_handler(commands=["inbox"])
-def handle_inbox_cmd(message: Message) -> None:
-    """Показать входящие через команду."""
-    show_inbox(message.chat.id)
+# ---------- Reply-кнопки (внизу экрана) ----------
 
+@bot.message_handler(func=lambda m: m.text == "Написать письмо")
+def handle_write_button(message: Message) -> None:
+    user = get_user_by_telegram_id(message.from_user.id)
+    if not user:
+        bot.send_message(message.chat.id, "Сначала представьтесь — нажмите /start.")
+        return
 
-@bot.message_handler(commands=["stats"])
-def handle_stats(message: Message) -> None:
-    """Сколько всего анонимных сообщений."""
-    n = count_messages()
-    bot.send_message(
-        message.chat.id,
-        f"📊 Всего анонимных сообщений: <b>{n}</b>",
-        parse_mode="HTML",
-    )
-
-
-# ---------- Нажатия на кнопки ----------
-
-@bot.callback_query_handler(func=lambda c: c.data in {"write", "inbox", "help"})
-def handle_callback(callback: CallbackQuery) -> None:
-    """Обрабатывает нажатия на inline-кнопки."""
-    action = callback.data
-    chat_id = callback.message.chat.id
-
-    if action == "write":
-        user_states[callback.from_user.id] = "writing"
-        bot.send_message(
-            chat_id,
-            "✍️ <b>Окей, пиши.</b> Я сохраню анонимно.",
-            parse_mode="HTML",
-        )
-
-    elif action == "inbox":
-        show_inbox(chat_id)
-
-    elif action == "help":
-        bot.send_message(
-            chat_id,
-            "🤖 <b>Команды:</b>\n"
-            "/start  /send  /inbox  /stats  /help",
-            parse_mode="HTML",
-        )
-
-    # Убирает «часики» на кнопке (типа «запрос обработан»)
-    bot.answer_callback_query(callback.id)
-
-
-# ---------- Получение текста ----------
-
-@bot.message_handler(func=lambda m: True)
-def handle_text(message: Message) -> None:
-    """Ловим любой текст. Если юзер в режиме writing — сохраняем."""
-    if user_states.get(message.from_user.id) == "writing":
-        # Сохраняем сообщение
-        msg_id = save_message(message.text)
-        user_states.pop(message.from_user.id, None)
-
+    clear_state(message.from_user.id)
+    kb = recipient_keyboard(user["name"])
+    if kb is None:
         bot.send_message(
             message.chat.id,
-            f"✅ Готово! Твоё сообщение сохранено анонимно.\n"
-            f"Номер: <b>#{msg_id}</b>",
-            parse_mode="HTML",
-            reply_markup=after_write_keyboard(),
-        )
-    else:
-        # Пользователь не в режиме writing — покажем меню
-        bot.send_message(
-            message.chat.id,
-            "🤔 Не понимаю. Нажми /start чтобы открыть меню.",
-            reply_markup=main_keyboard(),
-        )
-
-
-# ---------- Вспомогательные ----------
-
-def show_inbox(chat_id: int) -> None:
-    """Показывает последние анонимные сообщения."""
-    messages = get_recent_messages(limit=10)
-    if not messages:
-        bot.send_message(
-            chat_id,
-            "📭 Пока пусто. Будь первым — нажми «Написать анонимно».",
-            reply_markup=main_keyboard(),
+            NO_RECIPIENTS,
+            reply_markup=main_reply_keyboard(),
         )
         return
 
-    lines = ["📥 <b>Последние анонимные сообщения:</b>\n"]
+    bot.send_message(
+        message.chat.id,
+        "Выберите, кому хотите написать:",
+        reply_markup=kb,
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "Входящие")
+def handle_inbox_button(message: Message) -> None:
+    user = get_user_by_telegram_id(message.from_user.id)
+    if not user:
+        bot.send_message(message.chat.id, "Сначала представьтесь — нажмите /start.")
+        return
+
+    clear_state(message.from_user.id)
+    show_inbox(message.chat.id, user["name"])
+
+
+@bot.message_handler(func=lambda m: m.text == "Помощь")
+def handle_help_button(message: Message) -> None:
+    clear_state(message.from_user.id)
+    bot.send_message(
+        message.chat.id,
+        HELP_TEXT,
+        parse_mode="HTML",
+        reply_markup=main_reply_keyboard(),
+    )
+
+
+# ---------- Inline-кнопки (выбор получателя) ----------
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("to:"))
+def handle_recipient_choice(callback: CallbackQuery) -> None:
+    recipient_name = callback.data[len("to:"):]
+    user = get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        bot.answer_callback_query(
+            callback.id, "Сначала зарегистрируйтесь через /start"
+        )
+        return
+
+    user_states[callback.from_user.id] = f"writing:{recipient_name}"
+
+    bot.send_message(
+        callback.message.chat.id,
+        f"Пишите письмо для <b>{recipient_name}</b>.\n"
+        f"Оно будет доставлено анонимно. "
+        f"Чтобы отменить — нажмите /start или любую кнопку внизу.",
+        parse_mode="HTML",
+        reply_markup=main_reply_keyboard(),
+    )
+    bot.answer_callback_query(callback.id)
+
+
+# ---------- Обработка любого текста ----------
+
+@bot.message_handler(func=lambda m: True)
+def handle_text(message: Message) -> None:
+    state = user_states.get(message.from_user.id)
+
+    # Регистрация: ждём имя
+    if state == "awaiting_name":
+        name = (message.text or "").strip()
+        if not (1 <= len(name) <= 40):
+            bot.send_message(message.chat.id, NAME_REJECTED)
+            return
+
+        if register_user(message.from_user.id, name):
+            clear_state(message.from_user.id)
+            bot.send_message(
+                message.chat.id,
+                f"Приятно познакомиться, <b>{name}</b>.\n"
+                f"Теперь вы можете писать письма семье и получать их.",
+                parse_mode="HTML",
+                reply_markup=main_reply_keyboard(),
+            )
+        else:
+            existing = get_user_by_telegram_id(message.from_user.id)
+            clear_state(message.from_user.id)
+            bot.send_message(
+                message.chat.id,
+                f"Вы уже зарегистрированы как <b>{existing['name']}</b>.",
+                parse_mode="HTML",
+                reply_markup=main_reply_keyboard(),
+            )
+        return
+
+    # Пишем письмо для получателя
+    if state and state.startswith("writing:"):
+        recipient_name = state[len("writing:"):]
+        msg_id = save_message(recipient_name, message.text or "")
+        clear_state(message.from_user.id)
+
+        bot.send_message(
+            message.chat.id,
+            f"Письмо доставлено. Номер: <b>#{msg_id}</b>.",
+            parse_mode="HTML",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    # Любой другой текст — дружелюбная подсказка
+    user = get_user_by_telegram_id(message.from_user.id)
+    if user:
+        bot.send_message(
+            message.chat.id,
+            f"Я вас не совсем понял, <b>{user['name']}</b>.\n"
+            f"Используйте кнопки внизу экрана.",
+            parse_mode="HTML",
+            reply_markup=main_reply_keyboard(),
+        )
+    else:
+        bot.send_message(
+            message.chat.id,
+            "Здравствуйте. Нажмите /start, чтобы представиться.",
+        )
+
+
+# ---------- Вспомогательное: входящие ----------
+
+def show_inbox(chat_id: int, user_name: str) -> None:
+    messages = get_messages_for_recipient(user_name, limit=20)
+    if not messages:
+        bot.send_message(
+            chat_id, EMPTY_INBOX, reply_markup=main_reply_keyboard()
+        )
+        return
+
+    lines = [f"Входящие письма для <b>{user_name}</b>:\n"]
     for msg_id, text, created_at in messages:
-        # Если сообщение слишком длинное — обрежем
-        short = text if len(text) <= 200 else text[:197] + "..."
+        short = text if len(text) <= 300 else text[:297] + "..."
         lines.append(f"<b>#{msg_id}</b>  <i>({created_at})</i>\n{short}\n")
 
     bot.send_message(
         chat_id,
         "\n".join(lines),
         parse_mode="HTML",
-        reply_markup=main_keyboard(),
+        reply_markup=main_reply_keyboard(),
     )
 
 
 # ---------- Запуск ----------
 
 if __name__ == "__main__":
-    print("Бот запущен. Нажми Ctrl+C чтобы остановить.")
+    print(
+        f"Blazor запущен. "
+        f"Пользователей в базе: {count_users()}, "
+        f"писем: {count_messages()}."
+    )
     bot.polling()
