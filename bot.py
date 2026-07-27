@@ -324,9 +324,22 @@ def show_inbox(chat_id: int, user_name: str) -> None:
 # ---------- Запуск ----------
 
 if __name__ == "__main__":
+    import time
+
     print(
         f"Blazor запущен. "
         f"Пользователей в базе: {count_users()}, "
         f"писем: {count_messages()}."
     )
-    bot.polling()
+
+    # Защита от сетевых сбоев: если бот упал — подождать и перезапустить.
+    while True:
+        try:
+            bot.polling(non_stop=True, interval=1, timeout=30)
+        except KeyboardInterrupt:
+            print("Остановка по Ctrl+C")
+            break
+        except Exception as exc:
+            print(f"[!] Бот упал с ошибкой: {exc!r}")
+            print("    Перезапуск через 5 секунд...")
+            time.sleep(5)
