@@ -447,7 +447,14 @@ def _plural_letter(n: int) -> str:
 # ---------- Запуск ----------
 
 if __name__ == "__main__":
+    import logging
     import time
+
+    # Включаем логирование telebot, чтобы видеть что происходит
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
     print(
         f"Blazor запущен. "
@@ -456,13 +463,16 @@ if __name__ == "__main__":
     )
 
     # Защита от сетевых сбоев: если бот упал — подождать и перезапустить.
+    attempt = 0
     while True:
         try:
-            bot.polling(non_stop=True, interval=1, timeout=30)
+            attempt += 1
+            print(f"[poll #{attempt}] подключаюсь к Telegram...")
+            bot.polling(non_stop=True, interval=2, timeout=60, long_polling_timeout=60)
         except KeyboardInterrupt:
             print("Остановка по Ctrl+C")
             break
         except Exception as exc:
             print(f"[!] Бот упал с ошибкой: {exc!r}")
-            print("    Перезапуск через 5 секунд...")
-            time.sleep(5)
+            print("    Перезапуск через 10 секунд...")
+            time.sleep(10)
