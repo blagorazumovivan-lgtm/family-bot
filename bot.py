@@ -484,8 +484,17 @@ if __name__ == "__main__":
                 print(f"[poll #{attempt}] получено {len(updates)} update(s)")
                 for update in updates:
                     offset = update["update_id"] + 1
+                    # Извлекаем сообщения и callback_query и скармливаем боту
                     try:
-                        bot.process_new_updates([update])
+                        msgs = []
+                        if "message" in update:
+                            msgs.append(update["message"])
+                        if "edited_message" in update:
+                            msgs.append(update["edited_message"])
+                        if msgs:
+                            bot.process_new_messages(msgs)
+                        if "callback_query" in update:
+                            bot.process_new_callback_query([update["callback_query"]])
                     except Exception as exc:
                         print(f"[!] Ошибка обработки update {update.get('update_id')}: {exc!r}")
 
