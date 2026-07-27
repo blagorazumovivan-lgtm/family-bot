@@ -447,14 +447,9 @@ def _plural_letter(n: int) -> str:
 # ---------- Запуск ----------
 
 if __name__ == "__main__":
-    import logging
     import time
 
-    # Включаем логирование telebot, чтобы видеть что происходит
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    import requests
 
     print(
         f"Blazor запущен. "
@@ -462,17 +457,47 @@ if __name__ == "__main__":
         f"писем: {count_messages()}."
     )
 
-    # Защита от сетевых сбоев: если бот упал — подождать и перезапустить.
+    # Свой polling — он надёжнее чем bot.polling() от telebot.
+    # Не теряет сообщения при таймаутах.
+    offset = 0
     attempt = 0
     while True:
+        attempt += 1
         try:
-            attempt += 1
-            print(f"[poll #{attempt}] подключаюсь к Telegram...")
-            bot.polling(non_stop=True, interval=2, timeout=60, long_polling_timeout=60)
+            url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+            params = {
+                "offset": offset,
+                "timeout": 25,
+                "allowed_updates": ["message", "callback_query"],
+            }
+            print(f"[poll #{attempt}] спрашиваю updates, offset={offset}...")
+            resp = requests.get(url, params=params, timeout=30)
+            data = resp.json()
+
+            if not data.get("ok"):
+                print(f"[!] API вернул ошибку: {data}")
+                time.sleep(2)
+                continue
+
+            updates = data.get("result", [])
+            if updates:
+                print(f"[poll #{attempt}] получено {len(updates)} update(s)")
+                for update in updates:
+                    offset = update["update_id"] + 1
+                    try:
+                        bot.process_new_updates([update])
+                    except Exception as exc:
+                        print(f"[!] Ошибка обработки update {update.get('update_id')}: {exc!r}")
+
+        except requests.exceptions.Timeout:
+            # нормальный таймаут long-polling, просто продолжаем
+            continue
+        except requests.exceptions.RequestException as exc:
+            print(f"[!] Сетевая ошибка: {exc!r}")
+            time.sleep(3)
         except KeyboardInterrupt:
             print("Остановка по Ctrl+C")
             break
         except Exception as exc:
-            print(f"[!] Бот упал с ошибкой: {exc!r}")
-            print("    Перезапуск через 10 секунд...")
-            time.sleep(10)
+            print(f"[!] Неизвестная ошибка: {exc!r}")
+            time.sleep(3)
