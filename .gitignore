@@ -1,0 +1,16 @@
+# Секреты и окружение
+.env
+.venv
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Системные
+.DS_Store
