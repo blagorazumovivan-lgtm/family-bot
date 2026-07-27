@@ -9,7 +9,13 @@
 
 Хранение:
   users    — кто зарегистрировался (telegram_id ↔ name)
-  messages — анонимные письма (только recipient_name, без автора)
+  messages — анонимные письма
+             (recipient_name, is_read; автора в базе нет)
+
+Поведение:
+  — При сохранении письма бот сам отправляет push-уведомление получателю
+  — В главном меню кнопка «Входящие» показывает счётчик непрочитанных
+  — При просмотре /inbox все письма помечаются как прочитанные
 """
 
 import os
@@ -28,10 +34,13 @@ from telebot.types import (
 
 from db import (
     count_messages,
+    count_unread,
     count_users,
     get_all_users,
     get_messages_for_recipient,
+    get_user_by_name,
     get_user_by_telegram_id,
+    mark_all_read,
     register_user,
     save_message,
 )
@@ -63,19 +72,14 @@ WELCOME_NEW = (
     "члены семьи, когда будут писать вам."
 )
 
-WELCOME_BACK = (
-    "С возвращением, <b>{name}</b>.\n"
-    "Используйте кнопки внизу, чтобы написать письмо "
-    "или посмотреть входящие."
-)
-
 HELP_TEXT = (
     "<b>Что я умею:</b>\n\n"
     "<b>Написать письмо</b> — выбрать получателя и отправить "
     "анонимное письмо\n"
     "<b>Входящие</b> — посмотреть письма, адресованные вам\n"
     "<b>Помощь</b> — эта справка\n\n"
-    "Все письма анонимны. Никто не узнает автора."
+    "Все письма анонимны. Никто не узнает автора. "
+    "Когда вам пишут — приходит уведомление в Telegram."
 )
 
 EMPTY_INBOX = "Входящих пока нет. Подождите, пока кто-то решит вам написать."
@@ -87,15 +91,20 @@ NO_RECIPIENTS = (
 
 NAME_REJECTED = "Имя должно быть от 1 до 40 символов. Попробуйте ещё раз."
 
+LETTER_PUSH_HEADER = "Новое анонимное письмо!\n\n"
+
 
 # ---------- Клавиатуры ----------
 
-def main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Главное меню — кнопки внизу экрана (persistent)."""
+def main_reply_keyboard(unread_count: int = 0) -> ReplyKeyboardMarkup:
+    """Главное меню. На кнопке «Входящие» — счётчик непрочитанных."""
+    inbox_text = (
+        f"Входящие ({unread_count})" if unread_count > 0 else "Входящие"
+    )
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(
         KeyboardButton("Написать письмо"),
-        KeyboardButton("Входящие"),
+        KeyboardButton(inbox_text),
     )
     kb.add(KeyboardButton("Помощь"))
     return kb
@@ -126,6 +135,21 @@ def clear_state(user_id: int) -> None:
     user_states.pop(user_id, None)
 
 
+def safe_send(telegram_id: int, text: str) -> bool:
+    """
+    Пытается отправить сообщение юзеру в Telegram.
+    Возвращает True если успешно, False если нет (юзер не запустил бота,
+    заблокировал, и т.п.).
+    """
+    try:
+        bot.send_message(telegram_id, text, parse_mode="HTML")
+        return True
+    except Exception as exc:
+        # Типичные причины: юзер не начинал чат с ботом, или заблокировал
+        print(f"[!] Не удалось доставить push юзеру {telegram_id}: {exc!r}")
+        return False
+
+
 # ---------- Команды ----------
 
 @bot.message_handler(commands=["start"])
@@ -134,11 +158,19 @@ def handle_start(message: Message) -> None:
     user = get_user_by_telegram_id(message.from_user.id)
 
     if user:
+        unread = count_unread(user["name"])
+        extra = ""
+        if unread > 0:
+            extra = (
+                f"\n\nУ вас <b>{unread}</b> непрочитанных "
+                f"{_plural_letter(unread)}. "
+                f"Нажмите «Входящие» чтобы прочитать."
+            )
         bot.send_message(
             message.chat.id,
-            WELCOME_BACK.format(name=user["name"]),
+            f"С возвращением, <b>{user['name']}</b>.{extra}",
             parse_mode="HTML",
-            reply_markup=main_reply_keyboard(),
+            reply_markup=main_reply_keyboard(unread),
         )
     else:
         user_states[message.from_user.id] = "awaiting_name"
@@ -153,11 +185,13 @@ def handle_start(message: Message) -> None:
 @bot.message_handler(commands=["help"])
 def handle_help(message: Message) -> None:
     clear_state(message.from_user.id)
+    user = get_user_by_telegram_id(message.from_user.id)
+    unread = count_unread(user["name"]) if user else 0
     bot.send_message(
         message.chat.id,
         HELP_TEXT,
         parse_mode="HTML",
-        reply_markup=main_reply_keyboard(),
+        reply_markup=main_reply_keyboard(unread),
     )
 
 
@@ -187,8 +221,9 @@ def handle_write_button(message: Message) -> None:
     )
 
 
-@bot.message_handler(func=lambda m: m.text == "Входящие")
+@bot.message_handler(func=lambda m: m.text and m.text.startswith("Входящие"))
 def handle_inbox_button(message: Message) -> None:
+    """Ловит и 'Входящие', и 'Входящие (3)'."""
     user = get_user_by_telegram_id(message.from_user.id)
     if not user:
         bot.send_message(message.chat.id, "Сначала представьтесь — нажмите /start.")
@@ -201,11 +236,13 @@ def handle_inbox_button(message: Message) -> None:
 @bot.message_handler(func=lambda m: m.text == "Помощь")
 def handle_help_button(message: Message) -> None:
     clear_state(message.from_user.id)
+    user = get_user_by_telegram_id(message.from_user.id)
+    unread = count_unread(user["name"]) if user else 0
     bot.send_message(
         message.chat.id,
         HELP_TEXT,
         parse_mode="HTML",
-        reply_markup=main_reply_keyboard(),
+        reply_markup=main_reply_keyboard(unread),
     )
 
 
@@ -270,12 +307,32 @@ def handle_text(message: Message) -> None:
     # Пишем письмо для получателя
     if state and state.startswith("writing:"):
         recipient_name = state[len("writing:"):]
-        msg_id = save_message(recipient_name, message.text or "")
+        msg_text = message.text or ""
+        msg_id = save_message(recipient_name, msg_text)
         clear_state(message.from_user.id)
+
+        # Push-уведомление получателю в Telegram
+        recipient = get_user_by_name(recipient_name)
+        if recipient:
+            pushed = safe_send(
+                recipient["telegram_id"],
+                f"{LETTER_PUSH_HEADER}<i>{_escape(msg_text)}</i>",
+            )
+            push_status = (
+                "Уведомление доставлено."
+                if pushed
+                else "Получатель ещё не запускал бота — письмо "
+                "будет ждать во Входящих."
+            )
+        else:
+            push_status = (
+                "Получатель ещё не представился боту — письмо "
+                "будет ждать во Входящих."
+            )
 
         bot.send_message(
             message.chat.id,
-            f"Письмо доставлено. Номер: <b>#{msg_id}</b>.",
+            f"Письмо доставлено. Номер: <b>#{msg_id}</b>.\n{push_status}",
             parse_mode="HTML",
             reply_markup=main_reply_keyboard(),
         )
@@ -284,12 +341,13 @@ def handle_text(message: Message) -> None:
     # Любой другой текст — дружелюбная подсказка
     user = get_user_by_telegram_id(message.from_user.id)
     if user:
+        unread = count_unread(user["name"])
         bot.send_message(
             message.chat.id,
             f"Я вас не совсем понял, <b>{user['name']}</b>.\n"
             f"Используйте кнопки внизу экрана.",
             parse_mode="HTML",
-            reply_markup=main_reply_keyboard(),
+            reply_markup=main_reply_keyboard(unread),
         )
     else:
         bot.send_message(
@@ -301,6 +359,9 @@ def handle_text(message: Message) -> None:
 # ---------- Вспомогательное: входящие ----------
 
 def show_inbox(chat_id: int, user_name: str) -> None:
+    # Помечаем всё как прочитанное
+    marked = mark_all_read(user_name)
+
     messages = get_messages_for_recipient(user_name, limit=20)
     if not messages:
         bot.send_message(
@@ -308,17 +369,48 @@ def show_inbox(chat_id: int, user_name: str) -> None:
         )
         return
 
-    lines = [f"Входящие письма для <b>{user_name}</b>:\n"]
-    for msg_id, text, created_at in messages:
+    header = f"Входящие письма для <b>{user_name}</b>:"
+    if marked > 0:
+        header += f" ({marked} помечено как прочитанное)"
+    lines = [header + "\n"]
+
+    for msg_id, text, created_at, is_read in messages:
         short = text if len(text) <= 300 else text[:297] + "..."
-        lines.append(f"<b>#{msg_id}</b>  <i>({created_at})</i>\n{short}\n")
+        marker = "" if is_read else " <b>[новое]</b>"
+        lines.append(
+            f"<b>#{msg_id}</b>{marker}  <i>({created_at})</i>\n{short}\n"
+        )
 
     bot.send_message(
         chat_id,
         "\n".join(lines),
         parse_mode="HTML",
-        reply_markup=main_reply_keyboard(),
+        reply_markup=main_reply_keyboard(0),
     )
+
+
+# ---------- Вспомогательные для текста ----------
+
+def _escape(text: str) -> str:
+    """Экранирует символы, которые Telegram-парсер HTML может съесть."""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _plural_letter(n: int) -> str:
+    """Склонение: 1 письмо, 2 письма, 5 писем."""
+    n100 = n % 100
+    if 11 <= n100 <= 14:
+        return "писем"
+    n10 = n % 10
+    if n10 == 1:
+        return "письмо"
+    if 2 <= n10 <= 4:
+        return "письма"
+    return "писем"
 
 
 # ---------- Запуск ----------

@@ -5,7 +5,8 @@
   users     — зарегистрированные члены семьи
               (telegram_id — уникальный, name — как представился)
   messages  — анонимные письма
-              (recipient_name — кому; автора в базе нет)
+              (recipient_name — кому; is_read — прочитано или нет;
+               автора в базе нет)
 """
 
 import sqlite3
@@ -15,9 +16,10 @@ DB_PATH = "family_bot.db"
 
 
 def init_db() -> None:
-    """Создаёт таблицы, если их ещё нет."""
+    """Создаёт таблицы и применяет миграции."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -39,16 +41,23 @@ def init_db() -> None:
         """
     )
     conn.commit()
+
+    # Миграция: добавляем колонку is_read, если её ещё нет
+    cur.execute("PRAGMA table_info(messages)")
+    columns = {row[1] for row in cur.fetchall()}
+    if "is_read" not in columns:
+        cur.execute(
+            "ALTER TABLE messages ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.commit()
+
     conn.close()
 
 
 # ---------- users ----------
 
 def register_user(telegram_id: int, name: str) -> bool:
-    """
-    Регистрирует пользователя.
-    Возвращает True, если новый, False — если уже был зарегистрирован.
-    """
+    """Регистрирует пользователя. False, если уже зарегистрирован."""
     init_db()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -66,7 +75,6 @@ def register_user(telegram_id: int, name: str) -> bool:
 
 
 def get_user_by_telegram_id(telegram_id: int) -> dict | None:
-    """Возвращает {id, telegram_id, name, created_at} или None."""
     init_db()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -86,8 +94,29 @@ def get_user_by_telegram_id(telegram_id: int) -> dict | None:
     return None
 
 
+def get_user_by_name(name: str) -> dict | None:
+    """Поиск пользователя по имени (без учёта регистра)."""
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, telegram_id, name, created_at FROM users "
+        "WHERE LOWER(name) = LOWER(?)",
+        (name,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0],
+            "telegram_id": row[1],
+            "name": row[2],
+            "created_at": row[3],
+        }
+    return None
+
+
 def get_all_users() -> list[dict]:
-    """Возвращает всех зарегистрированных, отсортированных по имени."""
     init_db()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -115,12 +144,12 @@ def count_users() -> int:
 # ---------- messages ----------
 
 def save_message(recipient_name: str, text: str) -> int:
-    """Сохраняет анонимное письмо. Возвращает id."""
     init_db()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO messages (recipient_name, text, created_at) VALUES (?, ?, ?)",
+        "INSERT INTO messages (recipient_name, text, created_at) "
+        "VALUES (?, ?, ?)",
         (
             recipient_name,
             text,
@@ -134,25 +163,64 @@ def save_message(recipient_name: str, text: str) -> int:
 
 
 def get_messages_for_recipient(
-    name: str, limit: int = 20
-) -> list[tuple[int, str, str]]:
-    """Письма для конкретного получателя. [(id, text, created_at), ...]"""
+    name: str, limit: int = 20, only_unread: bool = False
+) -> list[tuple[int, str, str, int]]:
+    """[(id, text, created_at, is_read), ...] — сначала новые."""
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    if only_unread:
+        cur.execute(
+            """
+            SELECT id, text, created_at, is_read FROM messages
+            WHERE recipient_name = ? AND is_read = 0
+            ORDER BY id DESC LIMIT ?
+            """,
+            (name, limit),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT id, text, created_at, is_read FROM messages
+            WHERE recipient_name = ?
+            ORDER BY id DESC LIMIT ?
+            """,
+            (name, limit),
+        )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def count_unread(name: str) -> int:
+    """Сколько непрочитанных у получателя."""
     init_db()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        """
-        SELECT id, text, created_at
-        FROM messages
-        WHERE recipient_name = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (name, limit),
+        "SELECT COUNT(*) FROM messages "
+        "WHERE recipient_name = ? AND is_read = 0",
+        (name,),
     )
-    rows = cur.fetchall()
+    (n,) = cur.fetchone()
     conn.close()
-    return rows
+    return n
+
+
+def mark_all_read(name: str) -> int:
+    """Пометить все непрочитанные как прочитанные. Возвращает сколько."""
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE messages SET is_read = 1 "
+        "WHERE recipient_name = ? AND is_read = 0",
+        (name,),
+    )
+    n = cur.rowcount
+    conn.commit()
+    conn.close()
+    return n
 
 
 def count_messages() -> int:
