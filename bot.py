@@ -362,31 +362,62 @@ def show_inbox(chat_id: int, user_name: str) -> None:
     # Помечаем всё как прочитанное
     marked = mark_all_read(user_name)
 
-    messages = get_messages_for_recipient(user_name, limit=20)
+    # Показываем до 100 последних писем
+    messages = get_messages_for_recipient(user_name, limit=100)
     if not messages:
         bot.send_message(
             chat_id, EMPTY_INBOX, reply_markup=main_reply_keyboard()
         )
         return
 
+    # Собираем все строки
     header = f"Входящие письма для <b>{user_name}</b>:"
     if marked > 0:
         header += f" ({marked} помечено как прочитанное)"
-    lines = [header + "\n"]
-
+    lines = [header]
     for msg_id, text, created_at, is_read in messages:
         short = text if len(text) <= 300 else text[:297] + "..."
         marker = "" if is_read else " <b>[новое]</b>"
         lines.append(
-            f"<b>#{msg_id}</b>{marker}  <i>({created_at})</i>\n{short}\n"
+            f"<b>#{msg_id}</b>{marker}  <i>({created_at})</i>\n{short}"
         )
+    lines.append(f"\nВсего показано: {len(messages)}")
 
-    bot.send_message(
-        chat_id,
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=main_reply_keyboard(0),
-    )
+    # Telegram ограничивает сообщение 4096 символами.
+    # Если не влезает — режем по строкам на несколько сообщений.
+    full_text = "\n\n".join(lines)
+    MAX_LEN = 3800
+
+    if len(full_text) <= MAX_LEN:
+        bot.send_message(
+            chat_id,
+            full_text,
+            parse_mode="HTML",
+            reply_markup=main_reply_keyboard(0),
+        )
+        return
+
+    chunks: list[str] = []
+    current = ""
+    for line in lines:
+        candidate = (current + "\n\n" + line) if current else line
+        if len(candidate) > MAX_LEN and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    total = len(chunks)
+    for i, chunk in enumerate(chunks, start=1):
+        suffix = (
+            f"\n\n<i>(часть {i} из {total})</i>" if total > 1 else ""
+        )
+        kb = main_reply_keyboard(0) if i == total else None
+        bot.send_message(
+            chat_id, chunk + suffix, parse_mode="HTML", reply_markup=kb
+        )
 
 
 # ---------- Вспомогательные для текста ----------
