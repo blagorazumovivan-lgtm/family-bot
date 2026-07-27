@@ -30,26 +30,53 @@ def init_db() -> None:
         )
         """
     )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS messages (
-            id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            recipient_name TEXT    NOT NULL,
-            text           TEXT    NOT NULL,
-            created_at     TEXT    NOT NULL
-        )
-        """
-    )
     conn.commit()
 
-    # Миграция: добавляем колонку is_read, если её ещё нет
+    # Проверяем схему messages. Если её нет или она устаревшая — пересоздаём.
     cur.execute("PRAGMA table_info(messages)")
-    columns = {row[1] for row in cur.fetchall()}
-    if "is_read" not in columns:
+    existing = {row[1] for row in cur.fetchall()}
+
+    if not existing:
+        # Таблицы нет — создаём с нуля
         cur.execute(
-            "ALTER TABLE messages ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0"
+            """
+            CREATE TABLE messages (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                recipient_name TEXT    NOT NULL,
+                text           TEXT    NOT NULL,
+                created_at     TEXT    NOT NULL,
+                is_read        INTEGER NOT NULL DEFAULT 0
+            )
+            """
         )
         conn.commit()
+    else:
+        # Таблица есть — мигрируем
+        if "recipient_name" not in existing:
+            print(
+                "[db] Обнаружена устаревшая схема messages "
+                "(нет recipient_name). Пересоздаю."
+            )
+            cur.execute("DROP TABLE messages")
+            conn.commit()
+            cur.execute(
+                """
+                CREATE TABLE messages (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recipient_name TEXT    NOT NULL,
+                    text           TEXT    NOT NULL,
+                    created_at     TEXT    NOT NULL,
+                    is_read        INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.commit()
+        elif "is_read" not in existing:
+            cur.execute(
+                "ALTER TABLE messages "
+                "ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.commit()
 
     conn.close()
 
