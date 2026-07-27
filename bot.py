@@ -92,6 +92,10 @@ NO_RECIPIENTS = (
 NAME_REJECTED = "Имя должно быть от 1 до 40 символов. Попробуйте ещё раз."
 
 LETTER_PUSH_HEADER = "Новое анонимное письмо!\n\n"
+LETTER_PUSH_SHORT = (
+    "Новое анонимное письмо!\n"
+    "Откройте «Входящие», чтобы прочитать."
+)
 
 
 # ---------- Клавиатуры ----------
@@ -311,12 +315,12 @@ def handle_text(message: Message) -> None:
         msg_id = save_message(recipient_name, msg_text)
         clear_state(message.from_user.id)
 
-        # Push-уведомление получателю в Telegram
+        # Push-уведомление получателю в Telegram (короткое, без текста письма —
+        # сам текст показывается только в ленте «Входящие»)
         recipient = get_user_by_name(recipient_name)
         if recipient:
             pushed = safe_send(
-                recipient["telegram_id"],
-                f"{LETTER_PUSH_HEADER}<i>{_escape(msg_text)}</i>",
+                recipient["telegram_id"], LETTER_PUSH_SHORT
             )
             push_status = (
                 "Уведомление доставлено."
