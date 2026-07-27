@@ -9,10 +9,13 @@
                автора в базе нет)
 """
 
+import os
 import sqlite3
 from datetime import datetime
 
-DB_PATH = "family_bot.db"
+# На Render persistent disk монтируется в /data.
+# Локально (и в CI) используем текущую папку.
+DB_PATH = os.getenv("FAMILY_BOT_DB", "/data/family_bot.db" if os.path.isdir("/data") else "family_bot.db")
 
 
 def init_db() -> None:

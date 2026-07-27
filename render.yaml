@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: blazor-family-bot
+    runtime: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: FAMILY_BOT_DB
+        value: /data/family_bot.db
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    disk:
+      name: bot-data
+      mountPath: /data
+      sizeGB: 1
