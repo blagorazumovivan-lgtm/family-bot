@@ -449,64 +449,20 @@ def _plural_letter(n: int) -> str:
 if __name__ == "__main__":
     import time
 
-    import requests
-
     print(
         f"Blazor запущен. "
         f"Пользователей в базе: {count_users()}, "
         f"писем: {count_messages()}."
     )
 
-    # Свой polling — он надёжнее чем bot.polling() от telebot.
-    # Не теряет сообщения при таймаутах.
-    offset = 0
-    attempt = 0
+    # Защита от сетевых сбоев: если бот упал — подождать и перезапустить.
     while True:
-        attempt += 1
         try:
-            url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
-            params = {
-                "offset": offset,
-                "timeout": 25,
-                "allowed_updates": ["message", "callback_query"],
-            }
-            print(f"[poll #{attempt}] спрашиваю updates, offset={offset}...")
-            resp = requests.get(url, params=params, timeout=30)
-            data = resp.json()
-
-            if not data.get("ok"):
-                print(f"[!] API вернул ошибку: {data}")
-                time.sleep(2)
-                continue
-
-            updates = data.get("result", [])
-            if updates:
-                print(f"[poll #{attempt}] получено {len(updates)} update(s)")
-                for update in updates:
-                    offset = update["update_id"] + 1
-                    # Извлекаем сообщения и callback_query и скармливаем боту
-                    try:
-                        msgs = []
-                        if "message" in update:
-                            msgs.append(update["message"])
-                        if "edited_message" in update:
-                            msgs.append(update["edited_message"])
-                        if msgs:
-                            bot.process_new_messages(msgs)
-                        if "callback_query" in update:
-                            bot.process_new_callback_query([update["callback_query"]])
-                    except Exception as exc:
-                        print(f"[!] Ошибка обработки update {update.get('update_id')}: {exc!r}")
-
-        except requests.exceptions.Timeout:
-            # нормальный таймаут long-polling, просто продолжаем
-            continue
-        except requests.exceptions.RequestException as exc:
-            print(f"[!] Сетевая ошибка: {exc!r}")
-            time.sleep(3)
+            bot.polling(non_stop=True, interval=1, timeout=30)
         except KeyboardInterrupt:
             print("Остановка по Ctrl+C")
             break
         except Exception as exc:
-            print(f"[!] Неизвестная ошибка: {exc!r}")
-            time.sleep(3)
+            print(f"[!] Бот упал с ошибкой: {exc!r}")
+            print("    Перезапуск через 5 секунд...")
+            time.sleep(5)
