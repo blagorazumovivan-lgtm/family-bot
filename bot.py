@@ -165,14 +165,21 @@ def clear_state(user_id: int) -> None:
     user_states.pop(user_id, None)
 
 
-def safe_send(telegram_id: int, text: str) -> bool:
+def safe_send(telegram_id: int, text: str, silent: bool = False) -> bool:
     """
     Пытается отправить сообщение юзеру в Telegram.
+    silent=True — без звука и без вибрации (для «фоновых» уведомлений,
+    которые не должны отвлекать).
     Возвращает True если успешно, False если нет (юзер не запустил бота,
     заблокировал, и т.п.).
     """
     try:
-        bot.send_message(telegram_id, text, parse_mode="HTML")
+        bot.send_message(
+            telegram_id,
+            text,
+            parse_mode="HTML",
+            disable_notification=silent,
+        )
         return True
     except Exception as exc:
         # Типичные причины: юзер не начинал чат с ботом, или заблокировал
@@ -488,13 +495,15 @@ def show_family_statuses(chat_id: int) -> None:
 
 
 def broadcast_status_change(user_name: str, status_label: str) -> None:
-    """Шлёт пуш всем членам семьи (кроме автора изменения)."""
+    """Шлёт тихий пуш всем членам семьи (кроме автора изменения).
+    Без звука — статус «кто где» это фоновая инфа, не должна отвлекать."""
     for u in get_all_users_with_status():
         if u["name"].lower() == user_name.lower():
             continue
         safe_send(
             u["telegram_id"],
             f"📍 <b>{user_name}</b> теперь: {status_label}",
+            silent=True,
         )
 
 
