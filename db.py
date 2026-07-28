@@ -3,7 +3,8 @@
 
 Таблицы:
   users     — зарегистрированные члены семьи
-              (telegram_id — уникальный, name — как представился)
+              (telegram_id — уникальный, name — как представился;
+               status — где сейчас: apartment / dacha / grandparents / not_home)
   messages  — анонимные письма
               (recipient_name — кому; is_read — прочитано или нет;
                автора в базе нет)
@@ -80,6 +81,15 @@ def init_db() -> None:
                 "ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0"
             )
             conn.commit()
+
+    # Миграция users: добавляем колонки для статуса «где я».
+    cur.execute("PRAGMA table_info(users)")
+    user_cols = {row[1] for row in cur.fetchall()}
+    if "status" not in user_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN status TEXT")
+    if "status_updated_at" not in user_cols:
+        cur.execute("ALTER TABLE users ADD COLUMN status_updated_at TEXT")
+    conn.commit()
 
     conn.close()
 
@@ -261,3 +271,63 @@ def count_messages() -> int:
     (n,) = cur.fetchone()
     conn.close()
     return n
+
+
+# ---------- statuses (где я сейчас) ----------
+
+# Допустимые коды статусов
+STATUS_APARTMENT = "apartment"      # квартира
+STATUS_DACHA = "dacha"              # дача
+STATUS_GRANDPARENTS = "grandparents"  # у деда с бабой
+STATUS_NOT_HOME = "not_home"        # не дома
+
+VALID_STATUSES = {
+    STATUS_APARTMENT,
+    STATUS_DACHA,
+    STATUS_GRANDPARENTS,
+    STATUS_NOT_HOME,
+}
+
+
+def set_user_status(telegram_id: int, status: str) -> None:
+    """Устанавливает текущий статус пользователя. Пишет timestamp."""
+    if status not in VALID_STATUSES:
+        raise ValueError(f"Unknown status: {status}")
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users "
+        "SET status = ?, status_updated_at = ? "
+        "WHERE telegram_id = ?",
+        (
+            status,
+            datetime.now().strftime("%Y-%m-%d %H:%M"),
+            telegram_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_all_users_with_status() -> list[dict]:
+    """Все пользователи с их текущим статусом (если указали)."""
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, telegram_id, name, status, status_updated_at "
+        "FROM users ORDER BY name"
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {
+            "id": r[0],
+            "telegram_id": r[1],
+            "name": r[2],
+            "status": r[3],
+            "status_updated_at": r[4],
+        }
+        for r in rows
+    ]

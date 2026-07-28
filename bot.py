@@ -2,13 +2,15 @@
 Семейный Telegram-бот Blazor.
 
 Возможности:
-  /start   — поприветствовать / зарегистрироваться
+  /start         — поприветствовать / зарегистрироваться
   Написать письмо — выбрать получателя и отправить анонимное письмо
-  Входящие — посмотреть письма, адресованные тебе
-  Помощь  — справка
+  Входящие       — посмотреть письма, адресованные тебе
+  Где я?         — обновить свой статус (квартира / дача / у деда с бабой / не дома)
+  Кто где?       — посмотреть, где сейчас каждый член семьи
+  Помощь         — справка
 
 Хранение:
-  users    — кто зарегистрировался (telegram_id ↔ name)
+  users    — кто зарегистрировался (telegram_id ↔ name, status)
   messages — анонимные письма
              (recipient_name, is_read; автора в базе нет)
 
@@ -16,6 +18,7 @@
   — При сохранении письма бот сам отправляет push-уведомление получателю
   — В главном меню кнопка «Входящие» показывает счётчик непрочитанных
   — При просмотре /inbox все письма помечаются как прочитанные
+  — При смене статуса бот рассылает push-уведомление всем членам семьи
 """
 
 import os
@@ -37,12 +40,14 @@ from db import (
     count_unread,
     count_users,
     get_all_users,
+    get_all_users_with_status,
     get_messages_for_recipient,
     get_user_by_name,
     get_user_by_telegram_id,
     mark_all_read,
     register_user,
     save_message,
+    set_user_status,
 )
 
 # ---------- Настройка ----------
@@ -77,9 +82,12 @@ HELP_TEXT = (
     "<b>Написать письмо</b> — выбрать получателя и отправить "
     "анонимное письмо\n"
     "<b>Входящие</b> — посмотреть письма, адресованные вам\n"
+    "<b>Где я?</b> — сказать семье, где вы сейчас "
+    "(квартира / дача / у деда с бабой / не дома)\n"
+    "<b>Кто где?</b> — посмотреть, где сейчас каждый член семьи\n"
     "<b>Помощь</b> — эта справка\n\n"
     "Все письма анонимны. Никто не узнает автора. "
-    "Когда вам пишут — приходит уведомление в Telegram."
+    "Когда вам пишут или меняют статус — приходит уведомление в Telegram."
 )
 
 EMPTY_INBOX = "Входящих пока нет. Подождите, пока кто-то решит вам написать."
@@ -92,6 +100,14 @@ NO_RECIPIENTS = (
 NAME_REJECTED = "Имя должно быть от 1 до 40 символов. Попробуйте ещё раз."
 
 LETTER_PUSH_HEADER = "Новое анонимное письмо!\n\n"
+
+# Человекочитаемые названия статусов
+STATUS_LABELS = {
+    "apartment": "🏠 Квартира",
+    "dacha": "🌲 Дача",
+    "grandparents": "👴 У деда с бабой",
+    "not_home": "🚶 Не дома",
+}
 
 
 # ---------- Клавиатуры ----------
@@ -106,7 +122,21 @@ def main_reply_keyboard(unread_count: int = 0) -> ReplyKeyboardMarkup:
         KeyboardButton("Написать письмо"),
         KeyboardButton(inbox_text),
     )
+    kb.add(
+        KeyboardButton("Где я?"),
+        KeyboardButton("Кто где?"),
+    )
     kb.add(KeyboardButton("Помощь"))
+    return kb
+
+
+def status_keyboard() -> InlineKeyboardMarkup:
+    """Inline-кнопки для выбора одного из 4 статусов."""
+    kb = InlineKeyboardMarkup(row_width=2)
+    for code, label in STATUS_LABELS.items():
+        kb.add(
+            InlineKeyboardButton(label, callback_data=f"status:{code}")
+        )
     return kb
 
 
@@ -246,6 +276,43 @@ def handle_help_button(message: Message) -> None:
     )
 
 
+@bot.message_handler(func=lambda m: m.text == "Где я?")
+def handle_where_am_i(message: Message) -> None:
+    """Показывает инлайн-клавиатуру для смены своего статуса."""
+    user = get_user_by_telegram_id(message.from_user.id)
+    if not user:
+        bot.send_message(
+            message.chat.id, "Сначала представьтесь — нажмите /start."
+        )
+        return
+
+    clear_state(message.from_user.id)
+
+    current = user.get("status")
+    current_label = STATUS_LABELS.get(current, "<i>не указано</i>")
+
+    bot.send_message(
+        message.chat.id,
+        f"Где вы сейчас?\nТекущий статус: <b>{current_label}</b>",
+        parse_mode="HTML",
+        reply_markup=status_keyboard(),
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "Кто где?")
+def handle_whos_where(message: Message) -> None:
+    """Показывает, где сейчас каждый член семьи."""
+    user = get_user_by_telegram_id(message.from_user.id)
+    if not user:
+        bot.send_message(
+            message.chat.id, "Сначала представьтесь — нажмите /start."
+        )
+        return
+
+    clear_state(message.from_user.id)
+    show_family_statuses(message.chat.id)
+
+
 # ---------- Inline-кнопки (выбор получателя) ----------
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("to:"))
@@ -269,6 +336,37 @@ def handle_recipient_choice(callback: CallbackQuery) -> None:
         reply_markup=main_reply_keyboard(),
     )
     bot.answer_callback_query(callback.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("status:"))
+def handle_status_choice(callback: CallbackQuery) -> None:
+    """Юзер нажал одну из 4 кнопок статуса."""
+    status_code = callback.data[len("status:"):]
+    user = get_user_by_telegram_id(callback.from_user.id)
+    if not user:
+        bot.answer_callback_query(
+            callback.id, "Сначала зарегистрируйтесь через /start"
+        )
+        return
+
+    if status_code not in STATUS_LABELS:
+        bot.answer_callback_query(callback.id, "Неизвестный статус")
+        return
+
+    set_user_status(callback.from_user.id, status_code)
+    label = STATUS_LABELS[status_code]
+
+    bot.answer_callback_query(callback.id, f"Статус: {label}")
+    bot.send_message(
+        callback.message.chat.id,
+        f"Запомнила. Вы сейчас: <b>{label}</b>.\n"
+        f"Семья получит уведомление.",
+        parse_mode="HTML",
+        reply_markup=main_reply_keyboard(),
+    )
+
+    # Бродкастим всем остальным
+    broadcast_status_change(user["name"], label)
 
 
 # ---------- Обработка любого текста ----------
@@ -357,6 +455,48 @@ def handle_text(message: Message) -> None:
 
 
 # ---------- Вспомогательное: входящие ----------
+
+def show_family_statuses(chat_id: int) -> None:
+    """Печатает «кто где» — все члены семьи и их текущий статус."""
+    users = get_all_users_with_status()
+    if not users:
+        bot.send_message(
+            chat_id,
+            "В семье пока никого нет. Попросите близких запустить бота.",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    lines = ["<b>Кто где сейчас:</b>\n"]
+    for u in users:
+        status = u.get("status")
+        if status and status in STATUS_LABELS:
+            label = STATUS_LABELS[status]
+            ts = u.get("status_updated_at") or "—"
+            lines.append(
+                f"• {u['name']}: {label}  <i>(обновлено {ts})</i>"
+            )
+        else:
+            lines.append(f"• {u['name']}: <i>не указано</i>")
+
+    bot.send_message(
+        chat_id,
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=main_reply_keyboard(),
+    )
+
+
+def broadcast_status_change(user_name: str, status_label: str) -> None:
+    """Шлёт пуш всем членам семьи (кроме автора изменения)."""
+    for u in get_all_users_with_status():
+        if u["name"].lower() == user_name.lower():
+            continue
+        safe_send(
+            u["telegram_id"],
+            f"📍 <b>{user_name}</b> теперь: {status_label}",
+        )
+
 
 def show_inbox(chat_id: int, user_name: str) -> None:
     # Помечаем всё как прочитанное
