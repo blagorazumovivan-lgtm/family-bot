@@ -3,6 +3,7 @@
 
 Возможности:
   /start         — поприветствовать / зарегистрироваться
+  Спросить        — задать вопрос AI-помощнику (через MiniMax M2.7)
   Написать письмо — выбрать получателя и отправить анонимное письмо
   Входящие       — посмотреть письма, адресованные тебе
   Где я?         — обновить свой статус (квартира / дача / у деда с бабой / не дома)
@@ -19,10 +20,13 @@
   — В главном меню кнопка «Входящие» показывает счётчик непрочитанных
   — При просмотре /inbox все письма помечаются как прочитанные
   — При смене статуса бот рассылает push-уведомление всем членам семьи
+  — «Спросить» шлёт вопрос в MiniMax (Anthropic-совместимый API) и
+    возвращает ответ. История не сохраняется — каждый вопрос отдельно.
 """
 
 import os
 
+import anthropic
 import telebot
 from dotenv import load_dotenv
 from telebot.types import (
@@ -59,9 +63,18 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 
+# AI-конфиг (MiniMax, Anthropic-совместимый API).
+# Если ключа нет — «Спросить» вежливо скажет «не настроено», бот не падает.
+MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "").strip()
+ANTHROPIC_BASE_URL = os.getenv(
+    "ANTHROPIC_BASE_URL", "https://api.minimaxi.com/anthropic"
+)
+MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-M2.7")
+
 # Состояния пользователей:
 #   None                       — обычный режим
 #   "awaiting_name"            — ждём имя для регистрации
+#   "awaiting_question"        — ждём вопрос для AI
 #   "writing:<recipient_name>" — пишем письмо для конкретного получателя
 user_states: dict[int, str] = {}
 
@@ -79,6 +92,8 @@ WELCOME_NEW = (
 
 HELP_TEXT = (
     "<b>Что я умею:</b>\n\n"
+    "<b>Спросить</b> — задать вопрос AI-помощнику "
+    "(через MiniMax M2.7)\n"
     "<b>Написать письмо</b> — выбрать получателя и отправить "
     "анонимное письмо\n"
     "<b>Входящие</b> — посмотреть письма, адресованные вам\n"
@@ -88,6 +103,15 @@ HELP_TEXT = (
     "<b>Помощь</b> — эта справка\n\n"
     "Все письма анонимны. Никто не узнает автора. "
     "Когда вам пишут или меняют статус — приходит уведомление в Telegram."
+)
+
+# Системный промпт для AI-ответов. Дружелюбно, по-русски, без эмодзи.
+ASK_SYSTEM_PROMPT = (
+    "Ты — Blazor, дружелюбный AI-помощник для русскоязычной семьи. "
+    "Отвечай на русском, кратко и по делу. "
+    "Длинные ответы структурируй списками или шагами. "
+    "Не выдумывай факты — если не знаешь, скажи прямо. "
+    "Эмодзи в ответах не используй (если не попросят явно)."
 )
 
 EMPTY_INBOX = "Входящих пока нет. Подождите, пока кто-то решит вам написать."
@@ -119,14 +143,17 @@ def main_reply_keyboard(unread_count: int = 0) -> ReplyKeyboardMarkup:
     )
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(
+        KeyboardButton("Спросить"),
         KeyboardButton("Написать письмо"),
-        KeyboardButton(inbox_text),
     )
     kb.add(
+        KeyboardButton(inbox_text),
         KeyboardButton("Где я?"),
-        KeyboardButton("Кто где?"),
     )
-    kb.add(KeyboardButton("Помощь"))
+    kb.add(
+        KeyboardButton("Кто где?"),
+        KeyboardButton("Помощь"),
+    )
     return kb
 
 
@@ -233,6 +260,35 @@ def handle_help(message: Message) -> None:
 
 
 # ---------- Reply-кнопки (внизу экрана) ----------
+
+@bot.message_handler(func=lambda m: m.text == "Спросить")
+def handle_ask_button(message: Message) -> None:
+    """Кнопка «Спросить» — переводим в режим ожидания вопроса для AI."""
+    user = get_user_by_telegram_id(message.from_user.id)
+    if not user:
+        bot.send_message(
+            message.chat.id, "Сначала представьтесь — нажмите /start."
+        )
+        return
+
+    if not MINIMAX_API_KEY:
+        bot.send_message(
+            message.chat.id,
+            "AI-помощник пока не настроен: в .env не указан "
+            "MINIMAX_API_KEY. Попросите админа бота добавить ключ.",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    clear_state(message.from_user.id)
+    user_states[message.from_user.id] = "awaiting_question"
+    bot.send_message(
+        message.chat.id,
+        "Напишите свой вопрос — отвечу через пару секунд.\n"
+        "Чтобы отменить — /start или любая кнопка внизу.",
+        reply_markup=main_reply_keyboard(),
+    )
+
 
 @bot.message_handler(func=lambda m: m.text == "Написать письмо")
 def handle_write_button(message: Message) -> None:
@@ -409,6 +465,26 @@ def handle_text(message: Message) -> None:
             )
         return
 
+    # Вопрос к AI
+    if state == "awaiting_question":
+        clear_state(message.from_user.id)
+        question = (message.text or "").strip()
+        if not question:
+            bot.send_message(
+                message.chat.id,
+                "Пустой вопрос — нечего отвечать. Нажмите «Спросить» ещё раз.",
+                reply_markup=main_reply_keyboard(),
+            )
+            return
+
+        # Покажем «Думаю...» — потом обновим на ответ (если влезет)
+        thinking_msg = bot.send_message(message.chat.id, "Думаю...")
+        answer = ask_ai(question)
+        send_ai_answer(
+            message.chat.id, answer, thinking_msg.message_id
+        )
+        return
+
     # Пишем письмо для получателя
     if state and state.startswith("writing:"):
         recipient_name = state[len("writing:"):]
@@ -505,6 +581,97 @@ def broadcast_status_change(user_name: str, status_label: str) -> None:
             f"📍 <b>{user_name}</b> теперь: {status_label}",
             silent=True,
         )
+
+
+# ---------- AI: «Спросить» ----------
+
+def ask_ai(question: str) -> str:
+    """Шлёт вопрос в MiniMax (Anthropic-совместимый API) и возвращает ответ.
+    При любой ошибке возвращает короткое дружелюбное сообщение для юзера.
+    История не ведётся — каждый вопрос отдельно, без контекста."""
+    if not MINIMAX_API_KEY:
+        return "AI-ключ не настроен в .env."
+
+    try:
+        client = anthropic.Anthropic(
+            base_url=ANTHROPIC_BASE_URL,
+            api_key=MINIMAX_API_KEY,
+            timeout=30.0,
+        )
+        response = client.messages.create(
+            model=MINIMAX_MODEL,
+            max_tokens=1024,
+            system=ASK_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": question},
+            ],
+        )
+        parts = []
+        for block in response.content:
+            # У text-блоков есть .text; у thinking — .thinking
+            text = getattr(block, "text", None)
+            if text:
+                parts.append(text)
+        answer = "".join(parts).strip()
+        return answer or "AI вернул пустой ответ. Попробуйте иначе."
+    except anthropic.APITimeoutError:
+        return "AI не отвечает (таймаут 30 сек). Попробуйте позже."
+    except anthropic.APIConnectionError as exc:
+        return f"Нет связи с AI: {type(exc).__name__}. Попробуйте позже."
+    except anthropic.APIStatusError as exc:
+        return (
+            f"AI вернул ошибку {exc.status_code}: "
+            f"{getattr(exc, 'message', '')[:200] or type(exc).__name__}"
+        )
+    except anthropic.APIError as exc:
+        return f"Ошибка AI ({type(exc).__name__}). Попробуйте ещё раз."
+    except Exception as exc:
+        return f"Что-то пошло не так ({type(exc).__name__}). Попробуйте ещё раз."
+
+
+def send_ai_answer(chat_id: int, text: str, thinking_msg_id: int) -> None:
+    """Доставляет ответ AI в чат. Пытается отредактировать «Думаю...»,
+    если ответ короткий и edit проходит. Иначе — удаляет «Думаю...» и
+    шлёт ответ. Длинные ответы режет на части (лимит Telegram 4096)."""
+    MAX = 4000
+
+    # Короткий ответ — пробуем отредактировать «Думаю...»
+    if len(text) <= MAX:
+        try:
+            bot.edit_message_text(
+                text, chat_id=chat_id, message_id=thinking_msg_id
+            )
+            bot.send_message(
+                chat_id,
+                "Ещё что-нибудь? Жмите «Спросить».",
+                reply_markup=main_reply_keyboard(),
+            )
+            return
+        except Exception:
+            pass  # edit не сработал (например, слишком давно) — fallback
+
+    # Длинный ответ или edit не сработал — удаляем «Думаю...» и шлём как есть
+    try:
+        bot.delete_message(chat_id=chat_id, message_id=thinking_msg_id)
+    except Exception:
+        pass
+
+    if len(text) <= MAX:
+        bot.send_message(
+            chat_id, text, reply_markup=main_reply_keyboard()
+        )
+        return
+
+    # Длинный ответ — кусками
+    chunks = [text[i:i + MAX] for i in range(0, len(text), MAX)]
+    for i, chunk in enumerate(chunks, 1):
+        suffix = (
+            f"\n\n(часть {i} из {len(chunks)})" if len(chunks) > 1 else ""
+        )
+        bot.send_message(chat_id, chunk + suffix)
+    bot.send_message(
+        chat_id, "Готово.", reply_markup=main_reply_keyboard()
+    )
 
 
 def show_inbox(chat_id: int, user_name: str) -> None:

@@ -19,3 +19,7 @@ __pycache__/
 
 # Системные
 .DS_Store
+
+# Логи
+bot.log
+*.log
