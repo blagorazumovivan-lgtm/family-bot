@@ -67,7 +67,7 @@ bot = telebot.TeleBot(TOKEN)
 # Если ключа нет — «Спросить» вежливо скажет «не настроено», бот не падает.
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "").strip()
 ANTHROPIC_BASE_URL = os.getenv(
-    "ANTHROPIC_BASE_URL", "https://api.minimaxi.com/anthropic"
+    "ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic"
 )
 MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-M2.7")
 
